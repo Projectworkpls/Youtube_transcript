@@ -1,0 +1,10 @@
+streamlit==1.28.0
+yt-dlp==2023.11.16
+openai-whisper==20231117
+python-dotenv==1.0.0
+deep-translator==1.11.4
+google-api-python-client==2.104.0
+pydub==0.25.1
+requests==2.31.0
+tenacity==8.2.3
+youtube-transcript-api==0.6.1
