@@ -70,3 +70,50 @@ def get_youtube_transcript(video_id):
         except: return None
     except Exception:
         return None
+
+
+def get_video_info(url):
+    """Fixed duration parsing with better error handling"""
+    try:
+        video_id = extract_video_id(url)
+
+        # First try YouTube API
+        api_info = get_video_info_from_api(video_id)
+        if api_info:
+            snippet = api_info['snippet']
+            content_details = api_info['contentDetails']
+
+            # NEW: Robust duration parsing
+            duration_str = content_details['duration']
+            total_seconds = 0
+
+            # Parse ISO 8601 duration using precise regex
+            time_components = {
+                'H': 3600,
+                'M': 60,
+                'S': 1
+            }
+
+            for match in re.finditer(r'(\d+)([HMS])', duration_str):
+                value, unit = match.groups()
+                total_seconds += int(value) * time_components[unit]
+
+            return {
+                'title': snippet['title'],
+                'author': snippet['channelTitle'],
+                'length': total_seconds,  # Guaranteed integer
+                'thumbnail_url': snippet['thumbnails']['high']['url']
+            }
+
+        # Fallback to yt-dlp
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                'title': info.get('title', 'Unknown Title'),
+                'author': info.get('uploader', 'Unknown Author'),
+                'length': int(info.get('duration', 0)),  # Force integer conversion
+                'thumbnail_url': info.get('thumbnail', '')
+            }
+
+    except Exception as e:
+        raise ValueError(f"Error fetching video info: {str(e)}")
