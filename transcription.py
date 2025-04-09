@@ -10,108 +10,119 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 logger = logging.getLogger(__name__)
 
-
 class TranscriptionService:
     def __init__(self):
         self.model = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-        ]
-        self.cookie_file = "cookies.txt" if os.path.exists("cookies.txt") else None
-        self.proxies = self._load_proxies()
-
-    def _load_proxies(self):
-        """Load proxies from environment variables"""
-        proxy_str = os.getenv("YT_PROXIES", "")
-        return [p.strip() for p in proxy_str.split(",") if p.strip()] or [None]
+        self.device = self._get_device()
+        self.force_hindi = False
+        self._init_model()
+        
+    def _get_device(self):
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            return "cuda" 
+        return "cpu"
+    
+    def _init_model(self):
+        try:
+            # Start with base model for quick verification
+            self.model = whisper.load_model("base", device=self.device)
+            
+            # Test model with dummy audio
+            test_audio = torch.zeros((16000*5,))  # 5s of silence
+            self.model.transcribe(test_audio)
+            
+            # Now load desired model
+            self.model = whisper.load_model("medium" if self.device=="cuda" else "small", 
+                                          device=self.device)
+            if self.device == "cuda":
+                self.model = self.model.half()  # FP16 optimization
+                
+        except Exception as e:
+            logger.error(f"Model init failed: {e}")
+            self.device = "cpu"
+            self.model = whisper.load_model("tiny", device="cpu")
 
     def _get_ydl_options(self):
-        """Anti-bot configuration with fallbacks"""
-        opts = {
-            "format": "bestaudio/best",
-            "outtmpl": os.path.join(tempfile.gettempdir(), "yt_%(id)s.%(ext)s"),
-            "http_headers": {
-                "User-Agent": random.choice(self.user_agents),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.youtube.com/",
-                "X-Forwarded-For": f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}"
+        return {
+            'format': 'bestaudio/best',
+            'outtmpl': os.path.join(tempfile.gettempdir(), '%(id)s.%(ext)s'),
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Accept-Language': 'en-US,en;q=0.5'
             },
-            "retries": 15,
-            "fragment_retries": 15,
-            "ignoreerrors": False,
-            "extract_flat": "in_playlist",
-            "nocheckcertificate": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-            "throttled_rate": "1M",
-            "sleep_interval": random.randint(2, 5),
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'player_client': ['android']
+                }
+            },
+            'retries': 10,
+            'fragment_retries': 10,
+            'sleep_interval': random.randint(2, 5),
+            'ignoreerrors': True
         }
 
-        if self.cookie_file:
-            opts["cookiefile"] = self.cookie_file
-        if self.proxies[0]:
-            opts["proxy"] = random.choice(self.proxies)
-
-        return opts
-
-    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=10))
+    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=30))
     def download_audio(self, url):
-        """Robust download with retry logic"""
         try:
             ydl_opts = self._get_ydl_options()
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if not info:
                     raise ValueError("Empty response from YouTube")
-
+                
                 filename = ydl.prepare_filename(info)
-                valid_extensions = ['.webm', '.m4a', '.mp4']
-                for ext in valid_extensions:
-                    if filename.endswith(ext):
-                        return filename
-
-                raise ValueError("Invalid file format downloaded")
-
+                if not os.path.exists(filename):
+                    raise FileNotFoundError("Downloaded file missing")
+                    
+                return filename
         except Exception as e:
             raise ValueError(f"Download failed: {str(e)}")
 
+    def _transcribe_chunk(self, audio_path, start, end):
+        audio = whisper.load_audio(audio_path)
+        chunk = audio[start:end]
+        return self.model.transcribe(
+            chunk,
+            fp16=(self.device == "cuda"),
+            language='hi' if self.force_hindi else None,
+            beam_size=5 if self.force_hindi else None,
+            verbose=None
+        )["text"]
+
     def transcribe_audio(self, audio_path):
-        """Whisper transcription with cleanup"""
         try:
-            if not os.path.exists(audio_path):
-                raise FileNotFoundError(f"Audio file missing: {audio_path}")
-
-            if self.model is None:
-                torch.cuda.empty_cache() if self.device == "cuda" else None
-                self.model = whisper.load_model("small", device=self.device)
-
-            result = self.model.transcribe(
-                audio_path,
-                fp16=(self.device == "cuda"),
-                language="en",
-                verbose=False
-            )
-            return result["text"]
-
+            # Get audio duration
+            audio = whisper.load_audio(audio_path)
+            duration = len(audio) / 16000  # Sample rate
+            
+            if duration > 300:  # Chunk if >5 minutes
+                chunk_size = 16000 * 300  # 5min chunks
+                return " ".join(
+                    self._transcribe_chunk(audio_path, i, i+chunk_size)
+                    for i in range(0, len(audio), chunk_size)
+                )
+            else:
+                result = self.model.transcribe(
+                    audio_path,
+                    fp16=(self.device == "cuda"),
+                    language='hi' if self.force_hindi else None,
+                    verbose=None
+                )
+                return result["text"], result.get("language", "en").upper()
+                
         finally:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
 
     def process_video(self, url):
-        """Main processing pipeline"""
         try:
-            parsed = urlparse(url)
-            if not any(x in parsed.netloc for x in ['youtube.com', 'youtu.be']):
+            if not any(x in urlparse(url).netloc for x in ['youtube.com', 'youtu.be']):
                 raise ValueError("Invalid YouTube URL")
-
+            
             audio_path = self.download_audio(url)
             return self.transcribe_audio(audio_path)
-
+            
         except Exception as e:
             raise ValueError(f"Processing error: {str(e)}")
